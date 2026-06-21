@@ -1,0 +1,944 @@
+""" CLIP tokenizer
+
+Copied from https://github.com/openai/CLIP. Originally MIT License, Copyright (c) 2021 OpenAI.
+"""
+import gzip
+import html
+import base64
+import json
+import os
+import random
+import string
+from functools import lru_cache, partial
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
+import warnings
+
+import ftfy
+import numpy as np
+import regex as re
+import torch
+
+# https://stackoverflow.com/q/62691279
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+_nltk_init = False
+
+DEFAULT_CONTEXT_LENGTH = 77  # default context length for OpenAI CLIP
+
+
+@lru_cache()
+def default_bpe():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bpe_simple_vocab_16e6.txt.gz")
+
+
+@lru_cache()
+def bytes_to_unicode():
+    """
+    Returns list of utf-8 byte and a corresponding list of unicode strings.
+    The reversible bpe codes work on unicode strings.
+    This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
+    When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
+    This is a significant percentage of your normal, say, 32K bpe vocab.
+    To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
+    And avoids mapping to whitespace/control characters the bpe code barfs on.
+    """
+    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8+n)
+            n += 1
+    cs = [chr(n) for n in cs]
+    return dict(zip(bs, cs))
+
+
+def get_pairs(word):
+    """Return set of symbol pairs in a word.
+    Word is represented as tuple of symbols (symbols being variable-length strings).
+    """
+    pairs = set()
+    prev_char = word[0]
+    for char in word[1:]:
+        pairs.add((prev_char, char))
+        prev_char = char
+    return pairs
+
+
+def basic_clean(text):
+    text = ftfy.fix_text(text)
+    text = html.unescape(html.unescape(text))
+    return text.strip()
+
+
+def whitespace_clean(text):
+    text = " ".join(text.split())
+    text = text.strip()
+    return text
+
+
+def _clean_canonicalize(x):
+    # basic, remove whitespace, remove punctuation, lower case
+    return canonicalize_text(basic_clean(x))
+
+
+def _clean_lower(x):
+    # basic, remove whitespace, lower case
+    return whitespace_clean(basic_clean(x)).lower()
+
+
+def _clean_whitespace(x):
+    # basic, remove whitespace
+    return whitespace_clean(basic_clean(x))
+
+
+def _clean_whitespace_underscore(x):
+    # case- and punctuation-preserving 'whitespace' clean, plus snake_case separators -> spaces. Useful for
+    # verbatim-trained models fed machine-formatted labels (e.g. 'sea_waves' -> 'sea waves') without the
+    # lowercasing/punctuation-stripping of 'canonicalize'. Unicode normalization is inherited from basic_clean.
+    return whitespace_clean(basic_clean(x).replace("_", " "))
+
+
+def get_clean_fn(type: str):
+    if type == 'canonicalize':
+        return _clean_canonicalize
+    elif type == 'lower':
+        return _clean_lower
+    elif type == 'whitespace':
+        return _clean_whitespace
+    elif type == 'whitespace_underscore':
+        return _clean_whitespace_underscore
+    else:
+        assert False, f"Invalid clean function ({type})."
+
+
+def canonicalize_text(
+    text,
+    *,
+    keep_punctuation_exact_string=None,
+    trans_punctuation: dict = str.maketrans("", "", string.punctuation),
+):
+    """Returns canonicalized `text` (lowercase and punctuation removed).
+
+    From: https://github.com/google-research/big_vision/blob/53f18caf27a9419231bbf08d3388b07671616d3d/big_vision/evaluators/proj/image_text/prompt_engineering.py#L94
+
+    Args:
+      text: string to be canonicalized.
+      keep_punctuation_exact_string: If provided, then this exact string kept.
+        For example providing '{}' will keep any occurrences of '{}' (but will
+        still remove '{' and '}' that appear separately).
+    """
+    text = text.replace("_", " ")
+    if keep_punctuation_exact_string:
+        text = keep_punctuation_exact_string.join(
+            part.translate(trans_punctuation)
+            for part in text.split(keep_punctuation_exact_string)
+        )
+    else:
+        text = text.translate(trans_punctuation)
+    text = text.lower()
+    text = " ".join(text.split())
+    return text.strip()
+
+
+class SimpleTokenizer(object):
+    def __init__(
+            self,
+            bpe_path: str = default_bpe(),
+            additional_special_tokens: Optional[List[str]] = None,
+            context_length: Optional[int] = DEFAULT_CONTEXT_LENGTH,
+            clean: str = 'lower',
+            reduction_mask: str = ''
+    ):
+        self.byte_encoder = bytes_to_unicode()
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+        merges = gzip.open(bpe_path).read().decode("utf-8").split('\n')
+        merges = merges[1:49152-256-2+1]
+        merges = [tuple(merge.split()) for merge in merges]
+        vocab = list(bytes_to_unicode().values())
+        vocab = vocab + [v+'</w>' for v in vocab]
+        for merge in merges:
+            vocab.append(''.join(merge))
+        special_tokens = ['<start_of_text>', '<end_of_text>']
+        if additional_special_tokens:
+            special_tokens += additional_special_tokens
+        vocab.extend(special_tokens)
+        self.encoder = dict(zip(vocab, range(len(vocab))))
+        self.decoder = {v: k for k, v in self.encoder.items()}
+        self.bpe_ranks = dict(zip(merges, range(len(merges))))
+        self.cache = {t:t for t in special_tokens}
+        special = "|".join(special_tokens)
+        self.pat = re.compile(
+            special + r"""|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""",
+            re.IGNORECASE,
+        )
+        self.vocab_size = len(self.encoder)
+        self.all_special_ids = [self.encoder[t] for t in special_tokens]
+        self.sot_token_id = self.all_special_ids[0]
+        self.eot_token_id = self.all_special_ids[1]
+        self.context_length = context_length
+        self.clean_fn = get_clean_fn(clean)
+        self.reduction_fn = get_reduction_mask_fn(reduction_mask) if reduction_mask else None
+
+    def bpe(self, token):
+        if token in self.cache:
+            return self.cache[token]
+        word = tuple(token[:-1]) + ( token[-1] + '</w>',)
+        pairs = get_pairs(word)
+
+        if not pairs:
+            return token+'</w>'
+
+        while True:
+            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            if bigram not in self.bpe_ranks:
+                break
+            first, second = bigram
+            new_word = []
+            i = 0
+            while i < len(word):
+                try:
+                    j = word.index(first, i)
+                    new_word.extend(word[i:j])
+                    i = j
+                except Exception:
+                    new_word.extend(word[i:])
+                    break
+
+                if word[i] == first and i < len(word)-1 and word[i+1] == second:
+                    new_word.append(first+second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            word = new_word
+            if len(word) == 1:
+                break
+            else:
+                pairs = get_pairs(word)
+        word = ' '.join(word)
+        self.cache[token] = word
+        return word
+
+    def encode(self, text):
+        bpe_tokens = []
+        text = self.clean_fn(text)
+        for token in re.findall(self.pat, text):
+            token = ''.join(self.byte_encoder[b] for b in token.encode('utf-8'))
+            bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(' '))
+        return bpe_tokens
+
+    def decode(self, tokens):
+        text = ''.join([self.decoder[token] for token in tokens])
+        text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors="replace").replace('</w>', ' ')
+        return text
+
+    def __call__(
+            self,
+            texts: Union[str, List[str]],
+            context_length: Optional[int] = None,
+            pad: bool = True,
+            output_mask: bool = False,
+    ) -> Union[torch.LongTensor, Tuple[torch.LongTensor, torch.Tensor]]:
+        """ Returns the tokenized representation of given input string(s)
+
+        Parameters
+        ----------
+        texts : Union[str, List[str]]
+            An input string or a list of input strings to tokenize
+        context_length : int
+            The context length to use; all CLIP models use 77 as the context length
+        output_mask : bool
+            Also return a [B, L] bool attention mask (True = real token, HF polarity). Length-derived,
+            so it stays exact even though this tokenizer pads with 0, a real vocab token.
+
+        Returns
+        -------
+        A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length],
+        plus the attention mask when ``output_mask`` is set.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        context_length = context_length or self.context_length
+        assert context_length, 'Please set a valid context length'
+
+        if not pad:
+            raise ValueError(
+                "SimpleTokenizer does not support variable-length tokenization because token id 0 "
+                "is part of the BPE vocabulary. Use TikTokenTokenizer or an HF tokenizer with a "
+                "reserved pad token for variable_text=True."
+            )
+
+        if self.reduction_fn is not None:
+            # use reduction strategy for tokenize if set, otherwise default to truncation below
+            result = self.reduction_fn(
+                texts,
+                context_length=context_length,
+                sot_token_id=self.sot_token_id,
+                eot_token_id=self.eot_token_id,
+                encode_fn=self.encode,
+            )
+            if output_mask:
+                # true lengths are not tracked through the reduction fns; positions through the first
+                # eot are valid by the right-padded contract (eot is a special id never emitted mid-text)
+                eot = result == self.eot_token_id
+                mask = eot.cumsum(dim=-1) - eot.long() == 0
+                return result, mask
+            return result
+
+        all_tokens = [[self.sot_token_id] + self.encode(text) + [self.eot_token_id] for text in texts]
+        truncated = []
+        for tokens in all_tokens:
+            if len(tokens) > context_length:
+                tokens = tokens[:context_length]  # Truncate
+                tokens[-1] = self.eot_token_id
+            truncated.append(tokens)
+        all_tokens = truncated
+
+        result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+
+        for i, tokens in enumerate(all_tokens):
+            result[i, :len(tokens)] = torch.tensor(tokens)
+
+        if output_mask:
+            # exact length-based validity: this tokenizer has no reserved pad (fills with 0, a real
+            # vocab token), so a value-derived mask cannot distinguish pad fill from genuine id-0 tokens
+            mask = torch.zeros_like(result, dtype=torch.bool)
+            for i, tokens in enumerate(all_tokens):
+                mask[i, :len(tokens)] = True
+            return result, mask
+
+        return result
+
+
+_tokenizer = SimpleTokenizer()
+
+
+def decode(output_ids: torch.Tensor):
+    output_ids = output_ids.cpu().numpy()
+    return _tokenizer.decode(output_ids)
+
+
+def tokenize(texts: Union[str, List[str]], context_length: int = DEFAULT_CONTEXT_LENGTH) -> torch.LongTensor:
+    return _tokenizer(texts, context_length=context_length)
+
+
+def random_mask_tokenize(
+        texts: Union[str, List[str]],
+        context_length: int,
+        sot_token_id: int,
+        eot_token_id: int,
+        encode_fn: Callable,
+        shuffle: bool = False,
+):
+    all_tokens = [encode_fn(text) for text in texts]
+    result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+
+    for i, tokens in enumerate(all_tokens):
+        tokens = torch.tensor(tokens)
+        num_tokens = len(tokens)
+        if num_tokens > context_length - 2:  # 2 for sot and eot token
+            num_keep = context_length - 2
+            indices = torch.randperm(len(tokens))
+            indices = indices[:num_keep]
+            if not shuffle:
+                indices = indices.msort()
+            tokens = tokens[indices]
+            num_tokens = num_keep
+        result[i, 0] = sot_token_id
+        result[i, 1:num_tokens + 1] = tokens
+        result[i, num_tokens + 1] = eot_token_id
+
+    return result
+
+
+def simple_mask_tokenize(
+        texts: Union[str, List[str]],
+        context_length: int,
+        sot_token_id: int,
+        eot_token_id: int,
+        encode_fn: Callable,
+):
+    all_tokens = [encode_fn(text) for text in texts]
+    result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+
+    for i, tokens in enumerate(all_tokens):
+        num_tokens = len(tokens)
+        if num_tokens > context_length - 2:  # 2 for sot and eot token
+            num_keep = context_length - 2
+            start_index = random.randint(0, num_tokens - num_keep)  # high is incl
+            tokens = tokens[start_index: start_index + num_keep]
+        tokens = [sot_token_id] + tokens + [eot_token_id]
+        result[i, :len(tokens)] = torch.tensor(tokens)
+
+    return result
+
+
+def syntax_mask_tokenize(
+        texts: Union[str, List[str]],
+        context_length: int,
+        sot_token_id: int,
+        eot_token_id: int,
+        encode_fn: Callable,
+) -> torch.LongTensor:
+    """ Returns the tokenized representation of given input string(s).
+    Apply syntax masking before tokenize.
+    """
+    import nltk
+    global _nltk_init
+    if not _nltk_init:
+        # run them for the first time
+        nltk.download('punkt')
+        nltk.download('averaged_perceptron_tagger')
+        _nltk_init = True
+
+    def get_order(x):
+        if x.startswith('NN'):
+            return 1
+        elif x.startswith('JJ'):
+            return 2
+        elif x.startswith('VB'):
+            return 3
+        else:
+            return 4
+
+    # syntax masking
+    new_texts = []
+    for text in texts:
+        list_tokens = nltk.tokenize.word_tokenize(text)
+        pos_tags = nltk.pos_tag(list_tokens)
+        #  sample the words by get_order method
+        order_list = [get_order(tag) for _, tag in pos_tags]
+        sorted_ids = np.argsort(np.array(order_list))
+        sampled_ids = sorted(sorted_ids[:context_length - 2]) # need 2 slots for sot and eot tokens
+        sampled_tokens = np.take(np.array(list_tokens), sampled_ids, axis=0)  # sample the tokens
+
+        new_text = ''
+        for token in sampled_tokens:
+            new_text = new_text + str(token) + ' '
+        new_text = new_text.strip()
+        new_texts.append(new_text)
+    texts = new_texts
+
+    all_tokens = [[sot_token_id] + encode_fn(text) + [eot_token_id] for text in texts]
+    result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+
+    for i, tokens in enumerate(all_tokens):
+        # still need first truncate because some words produces two tokens
+        if len(tokens) > context_length:
+            tokens = tokens[:context_length]  # Truncate
+            tokens[-1] = eot_token_id
+        result[i, :len(tokens)] = torch.tensor(tokens)
+
+    return result
+
+
+def get_reduction_mask_fn(type: str):
+    """ Choose strategy for dropping (masking) tokens to achieve target context length"""
+    assert type in ('simple', 'random', 'shuffle', 'syntax')
+    if type == 'simple':
+        return simple_mask_tokenize  # randomly select block [start:end]
+    elif type == 'random':
+        return random_mask_tokenize  # randomly drop tokens (keep order)
+    elif type == 'shuffle':
+        return partial(random_mask_tokenize, shuffle=True)  # randomly drop tokens (shuffle order)
+    elif type == 'syntax':
+        return syntax_mask_tokenize  # randomly drop prioritized by syntax
+    else:
+        assert False, F'Unknown type {type}.'
+
+
+class HFTokenizer:
+    """HuggingFace tokenizer wrapper with support for custom tokenization modes"""
+
+    def __init__(
+            self,
+            tokenizer_name: str,
+            context_length: Optional[int] = DEFAULT_CONTEXT_LENGTH,
+            clean: str = 'whitespace',
+            strip_sep_token: bool = False,
+            language: Optional[str] = None,
+            cache_dir: Optional[str] = None,
+            tokenizer_mode: Optional[str] = None,  # None, 'clips'
+            **kwargs
+    ):
+        self.tokenizer_mode = tokenizer_mode or ''
+        self.context_length = context_length
+        self.clean_fn = get_clean_fn(clean)
+        self.strip_sep_token = strip_sep_token
+
+        # NOTE: Left as example of loading custom tokenizer from file for experimentation
+        # if self.tokenizer_mode == 'bert_clips':
+        #     self.special_tokens = {
+        #         "bos_token": 1,
+        #         "eos_token": 2,
+        #         "cls_token": 101,
+        #         "pad_token": 0
+        #     }
+        #
+        #     # For BERT CLIPS mode with vocab file
+        #     from tokenizers import BertWordPieceTokenizer
+        #     if tokenizer_name.startswith('hf-hub:'):
+        #         from huggingface_hub import hf_hub_download
+        #         # Format: hf-hub:repo_id/filename
+        #         repo_url = tokenizer_name[7:]
+        #         parts = repo_url.split('/')
+        #         filename = parts[-1]
+        #         repo_id = '/'.join(parts[:-1])
+        #         vocab_file = hf_hub_download(repo_id=repo_id, filename=filename, cache_dir=cache_dir)
+        #         self.tokenizer = BertWordPieceTokenizer(lowercase=True)
+        #         self.tokenizer = self.tokenizer.from_file(vocab_file)
+        #     else:
+        #         # Assume tokenizer_name is a local path to a vocab file
+        #         self.tokenizer = BertWordPieceTokenizer(lowercase=True)
+        #         self.tokenizer = self.tokenizer.from_file(tokenizer_name)
+
+        # Standard HuggingFace tokenizer initialization
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            cache_dir=cache_dir,
+            **kwargs
+        )
+        # Keep pad_token_id as None when the underlying tokenizer has no reserved pad token: a 0 fallback is a
+        # real vocab id in most BPE vocabs, and downstream variable-text setup (get_text_pad_id) relies on None
+        # to reject tokenizers that cannot pad safely.
+        self.pad_token_id = self.tokenizer.pad_token_id
+        # open_clip pooling and masking assume right-padded sequences (causal no-mask path, last/eos index math,
+        # cls at position 0); force it for tokenizers that default to left padding (decoder-family).
+        self.tokenizer.padding_side = 'right'
+        self.eot_token_id = self.tokenizer.eos_token_id
+        if self.eot_token_id is None:
+            self.eot_token_id = self.tokenizer.sep_token_id
+        self.sot_token_id = self.tokenizer.bos_token_id
+        if self.sot_token_id is None:
+            self.sot_token_id = self.tokenizer.cls_token_id
+        self.vocab_size = len(self.tokenizer)
+
+        # Set language function if available
+        set_lang_fn = getattr(self.tokenizer, 'set_src_lang_special_tokens', None)
+        if callable(set_lang_fn):
+            self.set_lang_fn = set_lang_fn
+        if language is not None:
+            self.set_language(language)
+
+    def save_pretrained(self, dest):
+        self.tokenizer.save_pretrained(dest)
+
+    def __call__(
+            self,
+            texts: Union[str, List[str]],
+            context_length: Optional[int] = None,
+            pad: bool = True,
+            output_mask: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        # same cleaning as for default tokenizer, except lowercasing
+        # adding lower (for case-sensitive tokenizers) will make it more robust but less sensitive to nuance
+        if isinstance(texts, str):
+            texts = [texts]
+
+        context_length = context_length or self.context_length
+        assert context_length, 'Please set a valid context length in class init or call.'
+
+        texts = [self.clean_fn(text) for text in texts]
+
+        if output_mask and (not pad or self.tokenizer_mode == 'clips'):
+            raise ValueError(
+                "output_mask=True requires pad=True and the standard tokenizer mode "
+                "(variable-length collation derives its own validity)."
+            )
+
+        # Handle different tokenization modes
+        if self.tokenizer_mode == 'clips':
+            return self._clips_tokenize(texts, context_length, pad=pad)
+        else:
+            # Standard tokenization
+            encoded = self.tokenizer(
+                texts,
+                max_length=context_length,
+                padding='max_length' if pad else False,
+                truncation=True,
+                return_tensors='pt' if pad else None,
+            )
+            input_ids = encoded.input_ids if pad else encoded["input_ids"]
+            attn_mask = encoded.attention_mask.bool() if (pad and output_mask) else None
+
+            if self.strip_sep_token:
+                # pad_token_id can legitimately be None (no reserved pad token); fall back to the historical 0.
+                fill_id = 0 if self.pad_token_id is None else self.pad_token_id
+                if pad:
+                    sep_positions = input_ids == self.tokenizer.sep_token_id
+                    input_ids = torch.where(
+                        sep_positions,
+                        torch.full_like(input_ids, fill_id),
+                        input_ids,
+                    )
+                    if attn_mask is not None:
+                        # stripped sep positions carry fill, not content
+                        attn_mask = attn_mask & ~sep_positions
+                else:
+                    input_ids = [
+                        [fill_id if token == self.tokenizer.sep_token_id else token for token in tokens]
+                        for tokens in input_ids
+                    ]
+
+            if not pad:
+                return [torch.tensor(tokens, dtype=torch.long) for tokens in input_ids]
+
+            if attn_mask is not None:
+                return input_ids, attn_mask
+
+            return input_ids
+
+    def set_language(self, src_lang):
+        if hasattr(self, 'set_lang_fn'):
+            self.set_lang_fn(src_lang)
+        else:
+            warnings.warn('Cannot set language for the tokenizer.')
+
+    def _clips_tokenize(
+            self,
+            texts: List[str],
+            context_length: int,
+            pad: bool = True,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Use standard HF tokenizer but apply custom post-processing"""
+        # Use standard tokenizer without special tokens - we'll add our own
+        encoded_outputs = self.tokenizer(
+            texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            return_tensors=None
+        )
+
+        encoded = []
+        for tokens in encoded_outputs["input_ids"]:
+            tokens = tokens[:context_length - 3]  # Leave room for special tokens
+            tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+            encoded.append(tokens)
+
+        if not pad:
+            # Match the padded contract: the class token terminates the sequence. The body is truncated to
+            # context_length - 3 above, so [bos] + body + [eos] + [cls] always fits within context_length.
+            return [
+                torch.tensor(tokens + [self.tokenizer.cls_token_id], dtype=torch.long)
+                for tokens in encoded
+            ]
+
+        # Create result tensor and handle padding + class token
+        result = torch.zeros(len(encoded), context_length, dtype=torch.long)
+        for i, tokens in enumerate(encoded):
+            padded_tokens = self._pad_and_add_class_token(
+                tokens,
+                max_length=context_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                cls_token_id=self.tokenizer.cls_token_id,
+            )
+            result[i, :len(padded_tokens)] = torch.tensor(padded_tokens)
+
+        return result
+
+    def _pad_and_add_class_token(
+            self,
+            tokens: List[int],
+            max_length: int,
+            pad_token_id: int = 0,
+            cls_token_id: int = 101,
+    ) -> List[int]:
+        """ Add padding with class token at the end """
+        if len(tokens) > max_length - 1:
+            tokens = tokens[:max_length - 1]
+
+        # Add padding to reach max_length-1
+        if len(tokens) < max_length - 1:
+            tokens = tokens + [pad_token_id] * (max_length - 1 - len(tokens))
+
+        # Add class token at the end
+        tokens = tokens + [cls_token_id]
+        return tokens
+
+
+class SigLipTokenizer:
+    """HuggingFace tokenizer wrapper for SigLIP T5 compatible sentencepiece vocabs
+
+    NOTE: this is not needed in normal library use, but is used to import new sentencepiece tokenizers
+    into OpenCLIP. Leaving code here in case future models use new tokenizers.
+    """
+    VOCAB_FILES = {
+        # english, vocab_size=32_000
+        "c4-en": "http://storage.googleapis.com/t5-data/vocabs/cc_en.32000/sentencepiece.model",
+        # used in multilingual models (mT5, PaLI), vocab_size=250_000
+        "mc4": "http://storage.googleapis.com/t5-data/vocabs/mc4.250000.100extra/sentencepiece.model",
+        # used in SigLIP2 models, vocab_size=256000
+        "gemma": "http://storage.googleapis.com/big_vision/gemma_tokenizer.model",
+    }
+
+    def __init__(
+            self,
+            tokenizer_name: str,
+            context_length: Optional[int] = 64,
+    ):
+        if 'gemma' in tokenizer_name:
+            from transformers import GemmaTokenizerFast
+            tokenizer_cls = partial(
+                GemmaTokenizerFast, padding_side='right', add_bos_token=False, add_eos_token=True)
+        else:
+            from transformers import T5TokenizerFast
+            tokenizer_cls = partial(T5TokenizerFast, extra_ids=0)
+
+        if tokenizer_name in self.VOCAB_FILES:
+            # FIXME temporary hack?
+            import tempfile
+            import fsspec
+            vocab_file = self.VOCAB_FILES[tokenizer_name]
+            with tempfile.NamedTemporaryFile('wb') as dst:
+                with fsspec.open(vocab_file, 'rb') as src:
+                    dst.write(src.read())
+                self.tokenizer = tokenizer_cls(dst.name, legacy=False)
+        else:
+            self.tokenizer = tokenizer_cls(tokenizer_name, legacy=False)
+
+        self.tokenizer.pad_token_id = 0 if 'gemma' in tokenizer_name else 1
+        self.tokenizer.eos_token_id = 1
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.eot_token_id = self.tokenizer.eos_token_id
+        self.vocab_size = len(self.tokenizer)
+        self.context_length = context_length
+
+    def save_pretrained(self, dest):
+        self.tokenizer.save_pretrained(dest)
+
+    def __call__(
+            self,
+            texts: Union[str, List[str]],
+            context_length: Optional[int] = None,
+            pad: bool = True,
+            output_mask: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        # same cleaning as for default tokenizer, except lowercasing
+        # adding lower (for case-sensitive tokenizers) will make it more robust but less sensitive to nuance
+        if output_mask:
+            # SigLIP pads with the eos id (pad == eos), so a value-derived mask cannot separate the
+            # terminal eos from padding; no generative config uses this tokenizer.
+            raise NotImplementedError("SigLipTokenizer does not support output_mask.")
+        if isinstance(texts, str):
+            texts = [texts]
+
+        context_length = context_length or self.context_length
+        assert context_length, 'Please set a valid context length in class init or call.'
+
+        texts = [canonicalize_text(basic_clean(text)) for text in texts]
+        output = self.tokenizer(
+            texts,
+            return_tensors='pt' if pad else None,
+            max_length=context_length,
+            padding='max_length' if pad else False,
+            truncation=True,
+        )
+        if not pad:
+            return [torch.tensor(tokens, dtype=torch.long) for tokens in output.input_ids]
+        return output.input_ids
+
+
+class TikTokenTokenizer:
+    """tiktoken-based tokenizer for generative (autoregressive) captioning.
+
+    Wraps an OpenAI ``tiktoken`` BPE encoding (default ``cl100k_base``) for English-priority, fast tokenization.
+    tiktoken handles only the caption body; the control ids (EOS, PAD, BOS) are reserved *above* the base
+    vocabulary so they never collide with body tokens. Two output modes are supported:
+
+    - ``pad=True`` (default): a fixed ``[N, context_length]`` tensor padded with ``pad_id`` (CLIP-style contract).
+    - ``pad=False``: a list of variable-length 1-D tensors ``[BOS] + body + [EOS]`` for per-sample batching
+      (used by the NaFlex GenLIP "rows" data path, which pads within the batch).
+    """
+
+    def __init__(
+            self,
+            encoding_name: str = 'cl100k_base',
+            context_length: Optional[int] = 256,
+            add_bos: bool = True,
+            add_eos: bool = True,
+            clean: Optional[str] = None,
+            bpe_path: Optional[Union[str, os.PathLike]] = None,
+            encoding_config_path: Optional[Union[str, os.PathLike]] = None,
+    ):
+        try:
+            import tiktoken
+        except ImportError as e:
+            raise ImportError("Please install tiktoken to use TikTokenTokenizer (`pip install tiktoken`).") from e
+
+        self.encoding_name = encoding_name
+        if bpe_path is not None:
+            cfg = self._load_encoding_config(encoding_name, encoding_config_path)
+            mergeable_ranks = self._load_tiktoken_bpe(bpe_path)
+            special_tokens = {str(k): int(v) for k, v in cfg.get("special_tokens", {}).items()}
+            explicit_n_vocab = cfg.get("explicit_n_vocab")
+            if explicit_n_vocab is not None:
+                max_token_value = max(
+                    max(mergeable_ranks.values(), default=0),
+                    max(special_tokens.values(), default=0),
+                )
+                if (
+                        len(mergeable_ranks) + len(special_tokens) != explicit_n_vocab or
+                        max_token_value != explicit_n_vocab - 1
+                ):
+                    warnings.warn(
+                        f"Ignoring explicit_n_vocab={explicit_n_vocab} in tiktoken encoding config for "
+                        f"{encoding_name!r}: it does not match the loaded vocab ({len(mergeable_ranks)} ranks "
+                        f"+ {len(special_tokens)} special tokens, max token id {max_token_value}). Expected for "
+                        f"gapped-vocab assets exported by older open_clip versions, but can also indicate a "
+                        f"truncated or mismatched bpe file.",
+                        UserWarning,
+                    )
+                    explicit_n_vocab = None
+            self.enc = tiktoken.Encoding(
+                cfg.get("name", encoding_name),
+                pat_str=cfg["pat_str"],
+                mergeable_ranks=mergeable_ranks,
+                special_tokens=special_tokens,
+                explicit_n_vocab=explicit_n_vocab,
+            )
+        else:
+            self.enc = tiktoken.get_encoding(encoding_name)
+        self.encoding_name = self.enc.name
+        self.context_length = context_length
+        self.add_bos = add_bos
+        self.add_eos = add_eos
+        # Optional text cleaning ('canonicalize' / 'lower' / 'whitespace' / 'whitespace_underscore'); default None =
+        # verbatim. Verbatim is required for the generative captioning path (cleaning would strip case/punctuation
+        # it must reproduce). Contrastive configs can opt in via tokenizer_kwargs: 'canonicalize' (SigLIP-style
+        # lowercase + punctuation strip) or 'whitespace_underscore' (case/punctuation-preserving, only snake_case
+        # -> spaces -- best for a verbatim-trained model fed machine-formatted labels).
+        self.clean_fn = get_clean_fn(clean) if clean else None
+
+        # Reserve control ids above the base vocabulary so they never collide with body tokens.
+        base = self.enc.n_vocab
+        self.eot_token_id = base  # end-of-text / EOS
+        self.pad_token_id = base + 1
+        self.bos_token_id = base + 2
+        self.sot_token_id = self.bos_token_id  # alias for CLIP-style callers
+        self.all_special_ids = [self.eot_token_id, self.pad_token_id, self.bos_token_id]
+        self.vocab_size = base + 3
+
+    @staticmethod
+    def _load_tiktoken_bpe(path: Union[str, os.PathLike]) -> Dict[bytes, int]:
+        ranks = {}
+        with open(path, "rb") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                token, rank = line.split()
+                ranks[base64.b64decode(token)] = int(rank)
+        return ranks
+
+    @staticmethod
+    def _dump_tiktoken_bpe(ranks: Dict[bytes, int], path: Union[str, os.PathLike]) -> None:
+        with open(path, "wb") as f:
+            for token, rank in sorted(ranks.items(), key=lambda x: x[1]):
+                f.write(base64.b64encode(token) + b" " + str(rank).encode() + b"\n")
+
+    @staticmethod
+    def _load_encoding_config(encoding_name: str, path: Optional[Union[str, os.PathLike]]) -> Dict[str, object]:
+        if path is None:
+            raise ValueError(
+                f"encoding_config_path is required when loading tiktoken encoding {encoding_name!r} from bpe_path."
+            )
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def save_pretrained(self, dest: Union[str, os.PathLike]) -> Dict[str, str]:
+        dest = Path(dest)
+        asset_dir = dest / "open_clip_tiktoken"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = self.encoding_name.replace("/", "_")
+        bpe_path = asset_dir / f"{stem}.tiktoken"
+        config_path = asset_dir / f"{stem}.json"
+
+        self._dump_tiktoken_bpe(self.enc._mergeable_ranks, bpe_path)
+        config = {
+            "name": self.enc.name,
+            "pat_str": self.enc._pat_str,
+            "special_tokens": self.enc._special_tokens,
+        }
+        # n_vocab is max_token_value + 1 by construction, so tiktoken's explicit_n_vocab entry-count assertion
+        # only holds for dense id spaces; omit it for gapped vocabs (e.g. cl100k_base) or reload would fail.
+        if len(self.enc._mergeable_ranks) + len(self.enc._special_tokens) == self.enc.n_vocab:
+            config["explicit_n_vocab"] = self.enc.n_vocab
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+
+        return {
+            "tiktoken_bpe_path": str(bpe_path.relative_to(dest)),
+            "tiktoken_config_path": str(config_path.relative_to(dest)),
+        }
+
+    def encode(self, text: str) -> List[int]:
+        # encode_ordinary ignores any special-token markup in the text, treating it as plain bytes.
+        if self.clean_fn is not None:
+            text = self.clean_fn(text)
+        return self.enc.encode_ordinary(text)
+
+    def decode(self, tokens: List[int]) -> str:
+        body = [t for t in tokens if t < self.enc.n_vocab]
+        return self.enc.decode(body)
+
+    def _wrap(self, ids: List[int]) -> List[int]:
+        if self.add_bos:
+            ids = [self.bos_token_id] + ids
+        if self.add_eos:
+            ids = ids + [self.eot_token_id]
+        return ids
+
+    def __call__(
+            self,
+            texts: Union[str, List[str]],
+            context_length: Optional[int] = None,
+            pad: bool = True,
+            output_mask: bool = False,
+    ) -> Union[torch.LongTensor, List[torch.LongTensor], Tuple[torch.LongTensor, torch.Tensor]]:
+        """Tokenize text(s).
+
+        Args:
+            texts: A string or list of strings.
+            context_length: Max length (including control tokens). Defaults to ``self.context_length``.
+                Used for truncation in both modes and for padding in fixed mode.
+            pad: When True return a padded ``[N, context_length]`` tensor; when False return a list of
+                variable-length 1-D tensors.
+            output_mask: Also return a [N, context_length] bool attention mask (True = real token,
+                HF polarity). Requires ``pad=True``. Exact: the pad id is reserved above the vocab.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+        context_length = context_length or self.context_length
+
+        if output_mask and not pad:
+            raise ValueError("output_mask=True requires pad=True (variable-length collation derives its own validity).")
+
+        all_tokens = [self._wrap(self.encode(text)) for text in texts]
+        if context_length is not None:
+            truncated = []
+            for tokens in all_tokens:
+                if len(tokens) > context_length:
+                    tokens = tokens[:context_length]
+                    if self.add_eos:
+                        tokens[-1] = self.eot_token_id
+                truncated.append(tokens)
+            all_tokens = truncated
+
+        if not pad:
+            return [torch.tensor(tokens, dtype=torch.long) for tokens in all_tokens]
+
+        assert context_length, 'A context_length is required for padded (pad=True) tokenization.'
+        result = torch.full((len(all_tokens), context_length), self.pad_token_id, dtype=torch.long)
+        for i, tokens in enumerate(all_tokens):
+            result[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+
+        if output_mask:
+            return result, result != self.pad_token_id
+
+        return result
